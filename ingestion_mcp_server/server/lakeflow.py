@@ -60,8 +60,7 @@ def build_ingestion_definition(
 def build_pipeline_payload(request: CreateIngestionPipelineRequest) -> dict:
     """A JSON-serializable preview of the pipeline create request.
 
-    Used inside a supervisor plan so the user can review exactly what will be
-    created before confirming.
+    Lets a caller review exactly what will be created before confirming.
     """
     return {
         "name": request.pipeline_name,

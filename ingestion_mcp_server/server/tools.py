@@ -2,14 +2,17 @@
 
 These functions are thin wrappers: they validate input, enforce allowlists,
 require explicit confirmation on writes, and delegate the actual Databricks work
-to ``lakeflow.py``. The supervisor tools delegate to ``supervisor.py``.
+to ``lakeflow.py``.
 
 Tool surface (this MCP maps to a single source: Salesforce):
   Read  : list_connections, list_source_objects, validate_destination
   Write : create_connection, create_ingestion_pipeline, schedule_pipeline,
           trigger_update
-  Supervisor: supervisor_plan, supervisor_execute
   Observability: get_ingestion_status
+
+Routing across sources and human-in-the-loop orchestration are the job of an
+external supervisor (e.g. an Agent Bricks Multi-Agent Supervisor), not this
+server.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import logging
 
 from databricks.sdk import WorkspaceClient
 
-from . import lakeflow, supervisor
+from . import lakeflow
 from .config import allowlist_errors, connection_allowed
 from .schemas import (
     ConnectionInfo,
@@ -35,14 +38,12 @@ from .schemas import (
     SourceObjectInfo,
     StatusRequest,
     StatusResponse,
-    SupervisorExecuteRequest,
-    SupervisorPlanRequest,
     TriggerUpdateRequest,
     TriggerUpdateResponse,
     ValidateDestinationRequest,
     ValidateDestinationResponse,
 )
-from .store import plan_store
+from .store import idempotency_store
 
 logger = logging.getLogger("salesforce-lakeflow-mcp")
 
@@ -134,7 +135,7 @@ def register_tools(mcp) -> None:
                 status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
             ).model_dump()
 
-        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        cached = idempotency_store.seen_idempotency_key(request.idempotency_key)
         if cached is not None:
             return cached
 
@@ -155,7 +156,7 @@ def register_tools(mcp) -> None:
             connection_name=getattr(conn, "name", request.name),
             connection_type=request.connection_type.upper(),
         ).model_dump()
-        plan_store.record_idempotency(request.idempotency_key, result)
+        idempotency_store.record_idempotency(request.idempotency_key, result)
         logger.info("created connection %s", request.name)
         return result
 
@@ -171,7 +172,7 @@ def register_tools(mcp) -> None:
                 status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
             ).model_dump()
 
-        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        cached = idempotency_store.seen_idempotency_key(request.idempotency_key)
         if cached is not None:
             return cached
 
@@ -204,7 +205,7 @@ def register_tools(mcp) -> None:
             tables=tables,
             next_action="SCHEDULE_OR_TRIGGER",
         ).model_dump()
-        plan_store.record_idempotency(request.idempotency_key, result)
+        idempotency_store.record_idempotency(request.idempotency_key, result)
         logger.info("created pipeline %s", pipeline.pipeline_id)
         return result
 
@@ -219,7 +220,7 @@ def register_tools(mcp) -> None:
                 status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
             ).model_dump()
 
-        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        cached = idempotency_store.seen_idempotency_key(request.idempotency_key)
         if cached is not None:
             return cached
 
@@ -240,7 +241,7 @@ def register_tools(mcp) -> None:
             pipeline_id=request.pipeline_id,
             cron_expression=request.schedule.cron_expression,
         ).model_dump()
-        plan_store.record_idempotency(request.idempotency_key, result)
+        idempotency_store.record_idempotency(request.idempotency_key, result)
         logger.info("scheduled pipeline %s (job %s)", request.pipeline_id, result["job_id"])
         return result
 
@@ -255,7 +256,7 @@ def register_tools(mcp) -> None:
                 status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
             ).model_dump()
 
-        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        cached = idempotency_store.seen_idempotency_key(request.idempotency_key)
         if cached is not None:
             return cached
 
@@ -273,61 +274,9 @@ def register_tools(mcp) -> None:
             update_id=update_id,
             full_refresh=request.full_refresh,
         ).model_dump()
-        plan_store.record_idempotency(request.idempotency_key, result)
+        idempotency_store.record_idempotency(request.idempotency_key, result)
         logger.info("triggered update %s for pipeline %s", update_id, request.pipeline_id)
         return result
-
-    # === SUPERVISOR (routing + human-in-the-loop) ===========================
-
-    @mcp.tool()
-    def supervisor_plan(request: SupervisorPlanRequest) -> dict:
-        """Route a gathered goal into a reviewable, ordered plan. Does NOT mutate.
-
-        Returns a ``plan_id`` that must be passed to ``supervisor_execute`` after
-        the user explicitly confirms.
-        """
-        plan = supervisor.build_plan(request.goal)
-        plan_id = plan_store.put(request.goal, plan.expires_at)
-        plan.plan_id = plan_id
-        return plan.model_dump()
-
-    @mcp.tool()
-    def supervisor_execute(request: SupervisorExecuteRequest) -> dict:
-        """Execute the write steps of a confirmed plan.
-
-        Only acts on a ``plan_id`` produced by ``supervisor_plan`` and requires
-        ``confirmation == 'CONFIRM'``. Idempotent via ``idempotency_key``.
-        """
-        if request.confirmation != "CONFIRM":
-            return {
-                "plan_id": request.plan_id,
-                "status": "REJECTED",
-                "error": "Explicit confirmation 'CONFIRM' is required.",
-            }
-
-        cached = plan_store.seen_idempotency_key(request.idempotency_key)
-        if cached is not None:
-            return cached
-
-        goal = plan_store.get(request.plan_id)
-        if goal is None:
-            return {
-                "plan_id": request.plan_id,
-                "status": "REJECTED",
-                "error": "Unknown or expired plan_id. Re-run supervisor_plan.",
-            }
-
-        result = supervisor.execute(_client(), goal)
-        result.plan_id = request.plan_id
-        payload = result.model_dump()
-
-        if result.status == "COMPLETED":
-            plan_store.consume(request.plan_id)
-        plan_store.record_idempotency(request.idempotency_key, payload)
-        logger.info(
-            "supervisor executed plan %s -> %s", request.plan_id, result.status
-        )
-        return payload
 
     # === OBSERVABILITY ======================================================
 

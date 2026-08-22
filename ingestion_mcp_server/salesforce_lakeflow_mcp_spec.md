@@ -53,10 +53,10 @@ The agent should never create resources immediately after inferring intent. It s
 > - **Write** (each needs `confirmation="CONFIRM"` + `idempotency_key`):
 >   `create_connection`, `create_ingestion_pipeline`, `schedule_pipeline`,
 >   `trigger_update`
-> - **Supervisor** (routing + human-in-the-loop): `supervisor_plan` (was
->   `plan_*`, read-only) and `supervisor_execute` (was `create_*`, runs the
->   confirmed plan's write steps in order).
+> - **Observability:** `get_ingestion_status`
 >
+> Routing and human-in-the-loop orchestration are handled by an external
+> supervisor (e.g. an Agent Bricks Multi-Agent Supervisor), not this server.
 > The JSON below is retained as the original design reference.
 
 ### `validate_salesforce_ingestion`

@@ -1,17 +1,17 @@
 """Pydantic request/response models for the Salesforce Lakeflow MCP tools.
 
-These models define the *tool contract*. Business logic lives in ``lakeflow.py``
-and orchestration in ``supervisor.py``; the tool functions in ``tools.py`` stay
-thin.
+These models define the *tool contract*. Business logic lives in ``lakeflow.py``;
+the tool functions in ``tools.py`` stay thin.
 
-Tool surface:
+This MCP maps to a single source (Salesforce). Tool surface:
   Read  : list_connections, list_source_objects, validate_destination
   Write : create_connection, create_ingestion_pipeline, schedule_pipeline,
           trigger_update
-  Supervisor: supervisor_plan, supervisor_execute (routing + HITL orchestration)
 
 Every write tool requires an explicit ``confirmation`` token and an
 ``idempotency_key`` so provisioning never happens on inferred intent alone.
+Orchestration/routing across sources is the job of an external supervisor
+(e.g. an Agent Bricks Multi-Agent Supervisor), not this server.
 """
 
 from __future__ import annotations
@@ -232,89 +232,7 @@ class TriggerUpdateResponse(BaseModel):
     error: str | None = None
 
 
-# --- SUPERVISOR: plan + execute --------------------------------------------
-
-
-class SupervisorGoal(BaseModel):
-    """The gathered intent the supervisor routes into an execution plan.
-
-    Genie (or another orchestrator) collects these slots conversationally; the
-    supervisor turns them into an ordered, reviewable plan and keeps the human
-    in the loop before any write step runs.
-    """
-
-    connection_name: str
-    destination_catalog: str
-    destination_schema: str
-    objects: list[SalesforceObject] = Field(min_length=1, max_length=250)
-    pipeline_name: str | None = Field(
-        default=None, description="Defaults to '<schema>_ingestion' when omitted."
-    )
-    schedule: Schedule | None = None
-    run_after_create: bool = Field(
-        default=True, description="Trigger a first update once the pipeline exists."
-    )
-    create_connection_if_missing: bool = Field(
-        default=False,
-        description="Include a create_connection step if the connection is absent.",
-    )
-
-
-class PlanStep(BaseModel):
-    """One ordered action in a supervisor plan."""
-
-    step: int
-    tool: str = Field(description="The MCP tool this step invokes.")
-    mutates: bool = Field(description="True for write steps that need confirmation.")
-    summary: str = Field(description="Human-readable description of the step.")
-    arguments: dict = Field(
-        default_factory=dict,
-        description="Tool arguments, minus confirmation/idempotency tokens.",
-    )
-
-
-class SupervisorPlanRequest(BaseModel):
-    goal: SupervisorGoal
-
-
-class SupervisorPlanResponse(BaseModel):
-    plan_id: str
-    expires_at: str
-    requires_confirmation: bool = True
-    steps: list[PlanStep] = Field(default_factory=list)
-    destination_tables: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-
-
-class SupervisorExecuteRequest(BaseModel):
-    plan_id: str
-    confirmation: Literal["CONFIRM"] = Field(
-        description="Must be 'CONFIRM' to run the write steps in the plan."
-    )
-    idempotency_key: str = Field(
-        description="Caller-supplied key so retries do not re-run the plan."
-    )
-
-
-class StepResult(BaseModel):
-    step: int
-    tool: str
-    status: str
-    detail: dict = Field(default_factory=dict)
-    error: str | None = None
-
-
-class SupervisorExecuteResponse(BaseModel):
-    plan_id: str
-    status: str
-    steps: list[StepResult] = Field(default_factory=list)
-    pipeline_id: str | None = None
-    job_id: str | None = None
-    tables: list[str] = Field(default_factory=list)
-    error: str | None = None
-
-
-# --- get_pipeline_status (kept for observability) --------------------------
+# --- get_pipeline_status (observability) -----------------------------------
 
 
 class StatusRequest(BaseModel):

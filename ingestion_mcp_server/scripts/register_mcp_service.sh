@@ -82,8 +82,6 @@ cli api post \
       "create_ingestion_pipeline",
       "schedule_pipeline",
       "trigger_update",
-      "supervisor_plan",
-      "supervisor_execute",
       "get_ingestion_status"
     ]
   }

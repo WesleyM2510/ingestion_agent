@@ -2,13 +2,16 @@
 
 A domain-specific [MCP](https://modelcontextprotocol.io) server for the
 **Salesforce** source of Lakeflow Connect. **One MCP maps to a single source**;
-this repo is the Salesforce MCP. It is hosted as a **stateless Databricks App**,
-registered as a governed **MCP Service** behind the Unity **AI Gateway**, and
-driven either directly by an agent/Chat or by the built-in **Multi-Agent
-Supervisor** that routes requests, builds plans, and keeps a human in the loop.
+this repo is the Salesforce MCP. It is hosted as a **stateless Databricks App**
+and registered as a governed **MCP Service** behind the Unity **AI Gateway**.
+
+Routing across sources and human-in-the-loop orchestration are the job of an
+**external supervisor** — e.g. an Agent Bricks Multi-Agent Supervisor that lists
+this MCP Service among its tools — not of this server. This repo stays focused
+on the Salesforce source tools.
 
 ```
-User → Supervisor (routing + HITL plan) → AI Gateway → this MCP (Salesforce)
+Supervisor (external, e.g. Agent Bricks MAS) → AI Gateway → this MCP (Salesforce)
      → Databricks SDK → Lakeflow Connect pipeline (+ optional Job schedule)
      → Salesforce → Unity Catalog Streaming Tables
 ```
@@ -20,10 +23,9 @@ User → Supervisor (routing + HITL plan) → AI Gateway → this MCP (Salesforc
 | `server/app.py` | FastMCP + FastAPI app, `/mcp` endpoint (`stateless_http=True`) |
 | `server/main.py` | uvicorn entry point (`salesforce-mcp-server`) |
 | `server/tools.py` | The MCP tools — thin wrappers, no business logic |
-| `server/supervisor.py` | Multi-Agent Supervisor: routing, planning, HITL execution |
 | `server/lakeflow.py` | Databricks adapter: payload building + SDK calls |
 | `server/schemas.py` | Pydantic request/response models (the tool contract) |
-| `server/store.py` | In-memory plan-approval + idempotency store |
+| `server/store.py` | In-memory idempotency store |
 | `server/config.py` | Catalog / schema / connection allowlists (env-driven) |
 | `app.yaml` | Databricks App command + allowlist env vars |
 
@@ -46,18 +48,13 @@ User → Supervisor (routing + HITL plan) → AI Gateway → this MCP (Salesforc
 | `schedule_pipeline` | Create a Lakeflow Job that refreshes the pipeline on cron |
 | `trigger_update` | Start an update (incremental by default) |
 
-**Supervisor** (routing + human-in-the-loop):
+Plus `get_ingestion_status` (read-only) for pipeline state + recent updates.
 
-| Tool | Mutates? | Notes |
-|------|----------|-------|
-| `supervisor_plan` | No | Routes a goal into an ordered, reviewable plan; returns `plan_id` |
-| `supervisor_execute` | **Yes** | Runs the plan's write steps; needs `plan_id` + `confirmation="CONFIRM"` |
-| `get_ingestion_status` | No | Pipeline state + recent updates (observability) |
-
-The key design decisions: **writes never happen on inferred intent** — every
-mutating tool needs an explicit `CONFIRM`, and the supervisor's `plan` is
-read-only while `execute` binds to a stored, reviewed `plan_id`. Allowlists are
-enforced by the server, not the LLM.
+The key design decision: **writes never happen on inferred intent** — every
+mutating tool needs an explicit `CONFIRM` and is idempotent via an
+`idempotency_key`. Allowlists are enforced by the server, not the caller. The
+`CONFIRM` guard is the server's own safety net; higher-level plan/approval flows
+belong to the external supervisor.
 
 ## Prerequisites
 
@@ -77,9 +74,9 @@ uv run salesforce-mcp-server        # serves http://localhost:8000/mcp
 uv run pytest                       # runs the no-workspace unit tests
 ```
 
-Test order: `list_connections` → `validate_destination` → `supervisor_plan`
-→ inspect the plan → `supervisor_execute` (with `confirmation="CONFIRM"`)
-against a sandbox catalog → `get_ingestion_status`.
+Test order: `list_connections` → `validate_destination` →
+`create_ingestion_pipeline` (with `confirmation="CONFIRM"`) against a sandbox
+catalog → `schedule_pipeline` / `trigger_update` → `get_ingestion_status`.
 
 ## Deploy to Databricks Apps (Asset Bundle)
 
@@ -111,7 +108,7 @@ connections or MCP Services, so a `postdeploy` hook
 1. a UC **HTTP connection** `salesforce_lakeflow_mcp_conn` pointing at the app
    (`/mcp`, per-user OAuth, scope `all-apis`);
 2. an **MCP Service** `cielo.default.salesforce_lakeflow_mcp` exposing only the
-   domain tools (3 read + 4 write + supervisor).
+   domain tools (3 read + 4 write + `get_ingestion_status`).
 
 ```bash
 databricks bundle deploy --profile e2-demo-field-eng             # creates the app
@@ -137,17 +134,12 @@ Add it in an agent / Chat by its three-level name
 Genie Code settings → MCP Servers → Add Server → Custom MCP server →
 `mcp-salesforce-lakeflow` → save → enable the tools.
 
-Two ways to drive it:
-
-- **Supervised (recommended):** collect connection/objects/destination/schedule
-  → call `supervisor_plan` → show the ordered plan → wait for explicit
-  `CONFIRM` → call `supervisor_execute`. The supervisor runs
-  validate → create_connection (optional) → create_ingestion_pipeline →
-  schedule_pipeline (optional) → trigger_update in order, stopping on the first
-  failure.
-- **Direct:** call the individual tools — `list_connections` /
-  `list_source_objects` / `validate_destination`, then the write tools each with
-  `confirmation="CONFIRM"`.
+Drive it by calling the tools in order: `list_connections` /
+`list_source_objects` / `validate_destination` (read), then the write tools
+(`create_connection` → `create_ingestion_pipeline` → `schedule_pipeline` →
+`trigger_update`) each with `confirmation="CONFIRM"`. An external supervisor
+(e.g. an Agent Bricks MAS) is responsible for slot-filling and showing a plan
+before confirming; this server only enforces the per-tool `CONFIRM` guard.
 
 Never request or display Salesforce credentials — OAuth is handled by the AI
 Gateway.
