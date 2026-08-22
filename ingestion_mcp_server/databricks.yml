@@ -1,0 +1,46 @@
+bundle:
+  name: mcp-salesforce-lakeflow
+
+# The whole project directory is synced to the workspace; app.yaml at the
+# source root tells Databricks Apps how to start the server and sets the
+# ALLOWED_* allowlist env vars.
+sync:
+  paths:
+    - .
+  exclude:
+    - .venv/**
+    - .pytest_cache/**
+    - "**/__pycache__/**"
+
+resources:
+  apps:
+    mcp_salesforce_lakeflow:
+      # Name must start with "mcp-" so Chat in Genie discovers it as an MCP server.
+      name: mcp-salesforce-lakeflow
+      description: "Conversational Salesforce Lakeflow Connect provisioning MCP server."
+      source_code_path: .
+
+# DABs has no resource type for UC connections or MCP Services, and the
+# connection must point at the app URL (which exists only after the app is
+# running). So a postdeploy hook registers both: a UC HTTP connection plus an
+# MCP Service at cielo.default.salesforce_lakeflow_mcp.
+#
+# Ordering: `bundle deploy` creates the app but does not start it; run
+# `bundle run mcp_salesforce_lakeflow` first so the app has a URL, then the
+# hook (which also fires on the next `deploy`) will find it. The script is
+# idempotent and re-runnable on its own.
+experimental:
+  scripts:
+    postdeploy: bash ./scripts/register_mcp_service.sh
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://e2-demo-field-eng.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://e2-demo-field-eng.cloud.databricks.com

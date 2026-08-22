@@ -1,0 +1,30 @@
+[project]
+name = "salesforce-lakeflow-mcp"
+version = "0.1.0"
+description = "MCP server that provisions Salesforce Lakeflow Connect ingestion pipelines."
+requires-python = ">=3.11"
+dependencies = [
+  "fastmcp>=2.0",
+  "fastapi",
+  "uvicorn",
+  # 0.124.0 and 0.125.0 are currently 403 on the internal PyPI proxy; cap
+  # below them so `uv sync` resolves to a fetchable wheel (0.123.0).
+  "databricks-sdk>=0.30,<0.124",
+  "pydantic>=2",
+]
+
+[dependency-groups]
+# Installed automatically by `uv sync` / `uv run`; keeps `uv run pytest` working.
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+salesforce-mcp-server = "server.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server"]

@@ -1,0 +1,14 @@
+command:
+  - uv
+  - run
+  - salesforce-mcp-server
+
+env:
+  # Deny-by-default allowlists enforced by the MCP server (not the LLM).
+  # Comma-separated. Leave empty for permissive local testing.
+  - name: ALLOWED_CATALOGS
+    value: ""
+  - name: ALLOWED_SCHEMAS
+    value: ""      # entries look like "main.salesforce_raw"
+  - name: ALLOWED_CONNECTIONS
+    value: ""
