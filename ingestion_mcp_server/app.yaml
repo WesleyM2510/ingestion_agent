@@ -4,6 +4,15 @@ command:
   - salesforce-mcp-server
 
 env:
+  # uv install tuning for the Apps build sandbox: the internal PyPI proxy can
+  # be slow, and uv's default 30s HTTP timeout + high concurrency causes
+  # "operation timed out" on random wheels. Raise the timeout and serialize
+  # downloads so a slow proxy doesn't trip the deadline.
+  - name: UV_HTTP_TIMEOUT
+    value: "300"
+  - name: UV_CONCURRENT_DOWNLOADS
+    value: "1"
+
   # Deny-by-default allowlists enforced by the MCP server (not the LLM).
   # Comma-separated. Leave empty for permissive local testing.
   - name: ALLOWED_CATALOGS
