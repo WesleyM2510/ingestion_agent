@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "MCP server that provisions Salesforce Lakeflow Connect ingestion pipelines."
 requires-python = ">=3.11"
 dependencies = [
-  "fastmcp>=2.0",
+  # Cap below 3.x: fastmcp 3 pulls a much larger dependency tree (authlib,
+  # openapi-pydantic, jsonschema-path, rich-rst, caio, ...). The 2.x line
+  # covers the tool()/http_app() API we use with far fewer wheels to install.
+  "fastmcp>=2.0,<3",
   "fastapi",
   "uvicorn",
   # 0.124.0 and 0.125.0 are currently 403 on the internal PyPI proxy; cap
