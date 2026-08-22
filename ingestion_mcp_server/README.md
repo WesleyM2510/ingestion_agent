@@ -1,15 +1,16 @@
-# Salesforce Lakeflow Connect MCP Server
+# Salesforce Lakeflow Ingestion Agent (MCP Server)
 
-A domain-specific [MCP](https://modelcontextprotocol.io) server that provisions
-**Salesforce Lakeflow Connect** ingestion pipelines conversationally. It is hosted
-as a **stateless Databricks App** and attached to **Chat in Genie** as a custom
-MCP server. Genie owns the conversation; this server owns validation, approval,
-provisioning, and monitoring.
+A domain-specific [MCP](https://modelcontextprotocol.io) server for the
+**Salesforce** source of Lakeflow Connect. **One MCP maps to a single source**;
+this repo is the Salesforce MCP. It is hosted as a **stateless Databricks App**,
+registered as a governed **MCP Service** behind the Unity **AI Gateway**, and
+driven either directly by an agent/Chat or by the built-in **Multi-Agent
+Supervisor** that routes requests, builds plans, and keeps a human in the loop.
 
 ```
-User → Chat in Genie → MCP Service → this server → Databricks SDK
-     → Lakeflow Connect pipeline (+ optional Lakeflow Job schedule)
-     → Salesforce → Unity Catalog Delta tables
+User → Supervisor (routing + HITL plan) → AI Gateway → this MCP (Salesforce)
+     → Databricks SDK → Lakeflow Connect pipeline (+ optional Job schedule)
+     → Salesforce → Unity Catalog Streaming Tables
 ```
 
 ## Layout
@@ -18,7 +19,8 @@ User → Chat in Genie → MCP Service → this server → Databricks SDK
 |------|---------|
 | `server/app.py` | FastMCP + FastAPI app, `/mcp` endpoint (`stateless_http=True`) |
 | `server/main.py` | uvicorn entry point (`salesforce-mcp-server`) |
-| `server/tools.py` | The 4 MCP tools — thin wrappers, no business logic |
+| `server/tools.py` | The MCP tools — thin wrappers, no business logic |
+| `server/supervisor.py` | Multi-Agent Supervisor: routing, planning, HITL execution |
 | `server/lakeflow.py` | Databricks adapter: payload building + SDK calls |
 | `server/schemas.py` | Pydantic request/response models (the tool contract) |
 | `server/store.py` | In-memory plan-approval + idempotency store |
@@ -27,16 +29,35 @@ User → Chat in Genie → MCP Service → this server → Databricks SDK
 
 ## Tools
 
+**Read** (safe, no confirmation):
+
+| Tool | Notes |
+|------|-------|
+| `list_connections` | UC connections, flagged against the allowlist |
+| `list_source_objects` | Best-effort Salesforce object discovery for a connection |
+| `validate_destination` | Checks allowlist + connection state before any write |
+
+**Write** (each requires `confirmation="CONFIRM"` + `idempotency_key`):
+
+| Tool | Notes |
+|------|-------|
+| `create_connection` | Create a Salesforce UC connection (OAuth handled by the Gateway) |
+| `create_ingestion_pipeline` | Create the Lakeflow Connect pipeline |
+| `schedule_pipeline` | Create a Lakeflow Job that refreshes the pipeline on cron |
+| `trigger_update` | Start an update (incremental by default) |
+
+**Supervisor** (routing + human-in-the-loop):
+
 | Tool | Mutates? | Notes |
 |------|----------|-------|
-| `validate_salesforce_ingestion` | No | Checks allowlist + connection state |
-| `plan_salesforce_ingestion` | No | Returns a reviewable `plan_id` |
-| `create_salesforce_ingestion` | **Yes** | Requires `plan_id`, `confirmation="CREATE"`, `idempotency_key` |
-| `get_ingestion_status` | No | Pipeline state + recent updates |
+| `supervisor_plan` | No | Routes a goal into an ordered, reviewable plan; returns `plan_id` |
+| `supervisor_execute` | **Yes** | Runs the plan's write steps; needs `plan_id` + `confirmation="CONFIRM"` |
+| `get_ingestion_status` | No | Pipeline state + recent updates (observability) |
 
-The key design decision: **plan is read-only; create binds to a stored plan
-and requires explicit confirmation**. Allowlists are enforced by the server,
-not the LLM. No delete / edit / full-refresh tools are exposed yet.
+The key design decisions: **writes never happen on inferred intent** — every
+mutating tool needs an explicit `CONFIRM`, and the supervisor's `plan` is
+read-only while `execute` binds to a stored, reviewed `plan_id`. Allowlists are
+enforced by the server, not the LLM.
 
 ## Prerequisites
 
@@ -56,8 +77,9 @@ uv run salesforce-mcp-server        # serves http://localhost:8000/mcp
 uv run pytest                       # runs the no-workspace unit tests
 ```
 
-Test order: list tools → `plan_salesforce_ingestion` → inspect payload →
-`create_salesforce_ingestion` against a sandbox catalog → `get_ingestion_status`.
+Test order: `list_connections` → `validate_destination` → `supervisor_plan`
+→ inspect the plan → `supervisor_execute` (with `confirmation="CONFIRM"`)
+against a sandbox catalog → `get_ingestion_status`.
 
 ## Deploy to Databricks Apps (Asset Bundle)
 
@@ -89,7 +111,7 @@ connections or MCP Services, so a `postdeploy` hook
 1. a UC **HTTP connection** `salesforce_lakeflow_mcp_conn` pointing at the app
    (`/mcp`, per-user OAuth, scope `all-apis`);
 2. an **MCP Service** `cielo.default.salesforce_lakeflow_mcp` exposing only the
-   four domain tools.
+   domain tools (3 read + 4 write + supervisor).
 
 ```bash
 databricks bundle deploy --profile e2-demo-field-eng             # creates the app
@@ -113,12 +135,22 @@ Add it in an agent / Chat by its three-level name
 ## Attach to Chat in Genie
 
 Genie Code settings → MCP Servers → Add Server → Custom MCP server →
-`mcp-salesforce-lakeflow` → save → enable the four tools.
+`mcp-salesforce-lakeflow` → save → enable the tools.
 
-Give Genie instructions to: collect connection/objects/destination/schedule →
-call `validate_*` then `plan_*` → show the plan → wait for explicit `CREATE` →
-call `create_*` → then `get_ingestion_status`. Never request or display
-Salesforce credentials.
+Two ways to drive it:
+
+- **Supervised (recommended):** collect connection/objects/destination/schedule
+  → call `supervisor_plan` → show the ordered plan → wait for explicit
+  `CONFIRM` → call `supervisor_execute`. The supervisor runs
+  validate → create_connection (optional) → create_ingestion_pipeline →
+  schedule_pipeline (optional) → trigger_update in order, stopping on the first
+  failure.
+- **Direct:** call the individual tools — `list_connections` /
+  `list_source_objects` / `validate_destination`, then the write tools each with
+  `confirmation="CONFIRM"`.
+
+Never request or display Salesforce credentials — OAuth is handled by the AI
+Gateway.
 
 ## Security allowlists
 

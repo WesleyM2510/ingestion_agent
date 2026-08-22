@@ -65,19 +65,25 @@ fi
 
 # --- Step 2: MCP Service under cielo.default ------------------------------
 # Beta: only REST API / UI can create MCP Services (no CLI verb, no SQL DDL).
-# include_tool_selectors restricts exposed tools to our four domain tools.
+# include_tool_selectors restricts exposed tools to our domain tools.
 echo ">> Registering MCP Service '${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}'."
 cli api post \
   "/api/2.1/unity-catalog/mcp-services?parent=schemas/${MCP_CATALOG}.${MCP_SCHEMA}&mcp_service_id=${MCP_SERVICE_ID}" \
   --json "$(cat <<JSON
 {
-  "comment": "Salesforce Lakeflow Connect provisioning MCP server.",
+  "comment": "Salesforce Lakeflow Connect ingestion agent MCP server.",
   "config": {
     "source_connection": { "name": "connections/${CONNECTION_NAME}" },
     "include_tool_selectors": [
-      "validate_salesforce_ingestion",
-      "plan_salesforce_ingestion",
-      "create_salesforce_ingestion",
+      "list_connections",
+      "list_source_objects",
+      "validate_destination",
+      "create_connection",
+      "create_ingestion_pipeline",
+      "schedule_pipeline",
+      "trigger_update",
+      "supervisor_plan",
+      "supervisor_execute",
       "get_ingestion_status"
     ]
   }

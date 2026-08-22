@@ -1,7 +1,17 @@
 """Pydantic request/response models for the Salesforce Lakeflow MCP tools.
 
-These models define the *tool contract*. Business logic lives in ``lakeflow.py``;
-the tool functions in ``tools.py`` stay thin.
+These models define the *tool contract*. Business logic lives in ``lakeflow.py``
+and orchestration in ``supervisor.py``; the tool functions in ``tools.py`` stay
+thin.
+
+Tool surface:
+  Read  : list_connections, list_source_objects, validate_destination
+  Write : create_connection, create_ingestion_pipeline, schedule_pipeline,
+          trigger_update
+  Supervisor: supervisor_plan, supervisor_execute (routing + HITL orchestration)
+
+Every write tool requires an explicit ``confirmation`` token and an
+``idempotency_key`` so provisioning never happens on inferred intent alone.
 """
 
 from __future__ import annotations
@@ -10,6 +20,9 @@ from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+# The literal a caller must send to authorize any mutating operation.
+CONFIRM_TOKEN = "CONFIRM"
 
 
 class ScdType(str, Enum):
@@ -37,7 +50,7 @@ class SalesforceObject(BaseModel):
 
 
 class Schedule(BaseModel):
-    """Optional Lakeflow Job schedule for periodic refresh."""
+    """A Lakeflow Job schedule for periodic refresh."""
 
     cron_expression: str = Field(
         description="Quartz cron expression, e.g. '0 0 2 * * ?' for daily 02:00."
@@ -47,17 +60,65 @@ class Schedule(BaseModel):
     )
 
 
-# --- validate_salesforce_ingestion ---------------------------------------
+# --- READ: list_connections ------------------------------------------------
 
 
-class ValidateRequest(BaseModel):
+class ListConnectionsRequest(BaseModel):
+    connection_type: str | None = Field(
+        default=None,
+        description="Optional filter, e.g. 'SALESFORCE'. Case-insensitive.",
+    )
+
+
+class ConnectionInfo(BaseModel):
+    name: str
+    connection_type: str | None = None
+    comment: str | None = None
+    owner: str | None = None
+    allowed: bool = Field(
+        default=True, description="Whether the connection is in the server allowlist."
+    )
+
+
+class ListConnectionsResponse(BaseModel):
+    connections: list[ConnectionInfo] = Field(default_factory=list)
+
+
+# --- READ: list_source_objects ---------------------------------------------
+
+
+class ListSourceObjectsRequest(BaseModel):
+    connection_name: str
+    source_schema: str | None = Field(
+        default=None, description="Optional source schema to scope the listing."
+    )
+    name_contains: str | None = Field(
+        default=None, description="Optional case-insensitive substring filter."
+    )
+
+
+class SourceObjectInfo(BaseModel):
+    source_schema: str
+    source_table: str
+
+
+class ListSourceObjectsResponse(BaseModel):
+    connection_name: str
+    objects: list[SourceObjectInfo] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+# --- READ: validate_destination --------------------------------------------
+
+
+class ValidateDestinationRequest(BaseModel):
     connection_name: str
     destination_catalog: str
     destination_schema: str
     objects: list[str] = Field(min_length=1, max_length=250)
 
 
-class ValidateResponse(BaseModel):
+class ValidateDestinationResponse(BaseModel):
     valid: bool
     connection_status: str | None = None
     objects_found: list[str] = Field(default_factory=list)
@@ -66,52 +127,194 @@ class ValidateResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-# --- plan_salesforce_ingestion --------------------------------------------
+# --- WRITE: create_connection ----------------------------------------------
 
 
-class PlanRequest(BaseModel):
-    pipeline_name: str
-    connection_name: str
-    destination_catalog: str
-    destination_schema: str
-    objects: list[SalesforceObject] = Field(min_length=1, max_length=250)
-    schedule: Schedule | None = None
-
-
-class PlanResponse(BaseModel):
-    plan_id: str
-    expires_at: str
-    requires_confirmation: bool = True
-    pipeline_payload: dict
-    job_payload: dict | None = None
-    destination_tables: list[str]
-    warnings: list[str] = Field(default_factory=list)
-
-
-# --- create_salesforce_ingestion ------------------------------------------
-
-
-class CreateRequest(BaseModel):
-    plan_id: str
-    confirmation: Literal["CREATE"] = Field(
-        description="Must be the literal 'CREATE' to authorize provisioning."
+class CreateConnectionRequest(BaseModel):
+    name: str = Field(description="Name for the new UC connection.")
+    connection_type: str = Field(
+        default="SALESFORCE",
+        description="UC connection type. Salesforce OAuth is the default.",
+    )
+    options: dict[str, str] = Field(
+        default_factory=dict,
+        description="Non-secret connection options (e.g. host). Secrets/OAuth are "
+        "handled by the AI Gateway, never passed here in plaintext.",
+    )
+    comment: str | None = None
+    confirmation: Literal["CONFIRM"] = Field(
+        description="Must be 'CONFIRM' to authorize creating the connection."
     )
     idempotency_key: str = Field(
         description="Caller-supplied key so retries do not create duplicates."
     )
 
 
-class CreateResponse(BaseModel):
+class CreateConnectionResponse(BaseModel):
+    status: str
+    connection_name: str | None = None
+    connection_type: str | None = None
+    error: str | None = None
+
+
+# --- WRITE: create_ingestion_pipeline --------------------------------------
+
+
+class CreateIngestionPipelineRequest(BaseModel):
+    pipeline_name: str
+    connection_name: str
+    destination_catalog: str
+    destination_schema: str
+    objects: list[SalesforceObject] = Field(min_length=1, max_length=250)
+    confirmation: Literal["CONFIRM"] = Field(
+        description="Must be 'CONFIRM' to authorize creating the pipeline."
+    )
+    idempotency_key: str = Field(
+        description="Caller-supplied key so retries do not create duplicates."
+    )
+
+
+class CreateIngestionPipelineResponse(BaseModel):
     status: str
     pipeline_id: str | None = None
-    job_id: str | None = None
     pipeline_name: str | None = None
     tables: list[str] = Field(default_factory=list)
     next_action: str | None = None
     error: str | None = None
 
 
-# --- get_ingestion_status --------------------------------------------------
+# --- WRITE: schedule_pipeline ----------------------------------------------
+
+
+class SchedulePipelineRequest(BaseModel):
+    pipeline_id: str
+    pipeline_name: str = Field(
+        description="Used to name the refresh Job, e.g. '<name>_schedule'."
+    )
+    schedule: Schedule
+    confirmation: Literal["CONFIRM"] = Field(
+        description="Must be 'CONFIRM' to authorize creating the schedule."
+    )
+    idempotency_key: str = Field(
+        description="Caller-supplied key so retries do not create duplicates."
+    )
+
+
+class SchedulePipelineResponse(BaseModel):
+    status: str
+    job_id: str | None = None
+    pipeline_id: str | None = None
+    cron_expression: str | None = None
+    error: str | None = None
+
+
+# --- WRITE: trigger_update -------------------------------------------------
+
+
+class TriggerUpdateRequest(BaseModel):
+    pipeline_id: str
+    full_refresh: bool = Field(
+        default=False, description="Reprocess all data instead of an incremental run."
+    )
+    confirmation: Literal["CONFIRM"] = Field(
+        description="Must be 'CONFIRM' to authorize starting an update."
+    )
+    idempotency_key: str = Field(
+        description="Caller-supplied key so retries do not start duplicate runs."
+    )
+
+
+class TriggerUpdateResponse(BaseModel):
+    status: str
+    pipeline_id: str | None = None
+    update_id: str | None = None
+    full_refresh: bool | None = None
+    error: str | None = None
+
+
+# --- SUPERVISOR: plan + execute --------------------------------------------
+
+
+class SupervisorGoal(BaseModel):
+    """The gathered intent the supervisor routes into an execution plan.
+
+    Genie (or another orchestrator) collects these slots conversationally; the
+    supervisor turns them into an ordered, reviewable plan and keeps the human
+    in the loop before any write step runs.
+    """
+
+    connection_name: str
+    destination_catalog: str
+    destination_schema: str
+    objects: list[SalesforceObject] = Field(min_length=1, max_length=250)
+    pipeline_name: str | None = Field(
+        default=None, description="Defaults to '<schema>_ingestion' when omitted."
+    )
+    schedule: Schedule | None = None
+    run_after_create: bool = Field(
+        default=True, description="Trigger a first update once the pipeline exists."
+    )
+    create_connection_if_missing: bool = Field(
+        default=False,
+        description="Include a create_connection step if the connection is absent.",
+    )
+
+
+class PlanStep(BaseModel):
+    """One ordered action in a supervisor plan."""
+
+    step: int
+    tool: str = Field(description="The MCP tool this step invokes.")
+    mutates: bool = Field(description="True for write steps that need confirmation.")
+    summary: str = Field(description="Human-readable description of the step.")
+    arguments: dict = Field(
+        default_factory=dict,
+        description="Tool arguments, minus confirmation/idempotency tokens.",
+    )
+
+
+class SupervisorPlanRequest(BaseModel):
+    goal: SupervisorGoal
+
+
+class SupervisorPlanResponse(BaseModel):
+    plan_id: str
+    expires_at: str
+    requires_confirmation: bool = True
+    steps: list[PlanStep] = Field(default_factory=list)
+    destination_tables: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SupervisorExecuteRequest(BaseModel):
+    plan_id: str
+    confirmation: Literal["CONFIRM"] = Field(
+        description="Must be 'CONFIRM' to run the write steps in the plan."
+    )
+    idempotency_key: str = Field(
+        description="Caller-supplied key so retries do not re-run the plan."
+    )
+
+
+class StepResult(BaseModel):
+    step: int
+    tool: str
+    status: str
+    detail: dict = Field(default_factory=dict)
+    error: str | None = None
+
+
+class SupervisorExecuteResponse(BaseModel):
+    plan_id: str
+    status: str
+    steps: list[StepResult] = Field(default_factory=list)
+    pipeline_id: str | None = None
+    job_id: str | None = None
+    tables: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+# --- get_pipeline_status (kept for observability) --------------------------
 
 
 class StatusRequest(BaseModel):

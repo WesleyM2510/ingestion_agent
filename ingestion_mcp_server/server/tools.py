@@ -1,8 +1,15 @@
-"""MCP tool definitions.
+"""MCP tool definitions for the Salesforce Lakeflow source.
 
 These functions are thin wrappers: they validate input, enforce allowlists,
-bind create-operations to a previously reviewed plan, and delegate the actual
-Databricks work to ``lakeflow.py``. Business logic does not live here.
+require explicit confirmation on writes, and delegate the actual Databricks work
+to ``lakeflow.py``. The supervisor tools delegate to ``supervisor.py``.
+
+Tool surface (this MCP maps to a single source: Salesforce):
+  Read  : list_connections, list_source_objects, validate_destination
+  Write : create_connection, create_ingestion_pipeline, schedule_pipeline,
+          trigger_update
+  Supervisor: supervisor_plan, supervisor_execute
+  Observability: get_ingestion_status
 """
 
 from __future__ import annotations
@@ -11,17 +18,29 @@ import logging
 
 from databricks.sdk import WorkspaceClient
 
-from . import lakeflow
-from .config import allowlist_errors
+from . import lakeflow, supervisor
+from .config import allowlist_errors, connection_allowed
 from .schemas import (
-    CreateRequest,
-    CreateResponse,
-    PlanRequest,
-    PlanResponse,
+    ConnectionInfo,
+    CreateConnectionRequest,
+    CreateConnectionResponse,
+    CreateIngestionPipelineRequest,
+    CreateIngestionPipelineResponse,
+    ListConnectionsRequest,
+    ListConnectionsResponse,
+    ListSourceObjectsRequest,
+    ListSourceObjectsResponse,
+    SchedulePipelineRequest,
+    SchedulePipelineResponse,
+    SourceObjectInfo,
     StatusRequest,
     StatusResponse,
-    ValidateRequest,
-    ValidateResponse,
+    SupervisorExecuteRequest,
+    SupervisorPlanRequest,
+    TriggerUpdateRequest,
+    TriggerUpdateResponse,
+    ValidateDestinationRequest,
+    ValidateDestinationResponse,
 )
 from .store import plan_store
 
@@ -34,18 +53,56 @@ def _client() -> WorkspaceClient:
 
 
 def register_tools(mcp) -> None:
-    @mcp.tool()
-    def validate_salesforce_ingestion(request: ValidateRequest) -> dict:
-        """Validate a Salesforce Lakeflow Connect request WITHOUT creating anything.
+    # === READ ===============================================================
 
-        Checks the destination allowlist and the connection state. Read-only.
+    @mcp.tool()
+    def list_connections(request: ListConnectionsRequest) -> dict:
+        """List Unity Catalog connections available to this source. Read-only.
+
+        Marks each connection with whether it passes the server allowlist.
+        """
+        try:
+            raw = lakeflow.list_connections(_client(), request.connection_type)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Connection listing failed: {exc}"}
+        connections = [
+            ConnectionInfo(allowed=connection_allowed(c["name"]), **c) for c in raw
+        ]
+        return ListConnectionsResponse(connections=connections).model_dump()
+
+    @mcp.tool()
+    def list_source_objects(request: ListSourceObjectsRequest) -> dict:
+        """List ingestible Salesforce objects behind a connection. Read-only.
+
+        Object discovery is best-effort; when unavailable the response carries a
+        warning and the caller should supply object names explicitly.
+        """
+        try:
+            objects, warnings = lakeflow.list_source_objects(
+                _client(),
+                request.connection_name,
+                request.source_schema,
+                request.name_contains,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Object listing failed: {exc}"}
+        return ListSourceObjectsResponse(
+            connection_name=request.connection_name,
+            objects=[SourceObjectInfo(**o) for o in objects],
+            warnings=warnings,
+        ).model_dump()
+
+    @mcp.tool()
+    def validate_destination(request: ValidateDestinationRequest) -> dict:
+        """Validate connection + destination WITHOUT creating anything. Read-only.
+
+        Checks the destination allowlist and the connection state.
         """
         errors = allowlist_errors(
             request.destination_catalog,
             request.destination_schema,
             request.connection_name,
         )
-
         connection_status: str | None = None
         try:
             connection_status = lakeflow.validate_connection(
@@ -54,7 +111,7 @@ def register_tools(mcp) -> None:
         except Exception as exc:  # noqa: BLE001 - surface as a validation error
             errors.append(f"Connection lookup failed: {exc}")
 
-        return ValidateResponse(
+        return ValidateDestinationResponse(
             valid=not errors,
             connection_status=connection_status,
             objects_found=request.objects,
@@ -63,81 +120,216 @@ def register_tools(mcp) -> None:
             warnings=[],
         ).model_dump()
 
-    @mcp.tool()
-    def plan_salesforce_ingestion(request: PlanRequest) -> dict:
-        """Create a reviewable, non-executable plan. Does NOT mutate Databricks.
-
-        Returns a ``plan_id`` that must be passed to
-        ``create_salesforce_ingestion`` after the user explicitly confirms.
-        """
-        errors = allowlist_errors(
-            request.destination_catalog,
-            request.destination_schema,
-            request.connection_name,
-        )
-        if errors:
-            return {"error": "; ".join(errors), "requires_confirmation": False}
-
-        # Build the plan first so we can store the request under its plan_id.
-        plan = lakeflow.build_plan_response(request, plan_id="pending")
-        plan_id = plan_store.put(request, plan.expires_at)
-        plan.plan_id = plan_id
-        return plan.model_dump()
+    # === WRITE (each requires confirmation == 'CONFIRM') ====================
 
     @mcp.tool()
-    def create_salesforce_ingestion(request: CreateRequest) -> dict:
-        """Create an approved pipeline (and optional schedule).
+    def create_connection(request: CreateConnectionRequest) -> dict:
+        """Create a Unity Catalog connection for this source.
 
-        Only acts on a plan_id produced by ``plan_salesforce_ingestion`` and
-        requires ``confirmation == 'CREATE'``. Idempotent via ``idempotency_key``.
+        Requires ``confirmation == 'CONFIRM'``. Secrets/OAuth are handled by the
+        AI Gateway — never pass Salesforce credentials in ``options``.
         """
-        if request.confirmation != "CREATE":
-            return CreateResponse(
-                status="REJECTED",
-                error="Explicit confirmation 'CREATE' is required.",
+        if request.confirmation != "CONFIRM":
+            return CreateConnectionResponse(
+                status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
             ).model_dump()
 
         cached = plan_store.seen_idempotency_key(request.idempotency_key)
         if cached is not None:
             return cached
 
-        plan_request = plan_store.get(request.plan_id)
-        if plan_request is None:
-            return CreateResponse(
-                status="REJECTED",
-                error="Unknown or expired plan_id. Re-run plan_salesforce_ingestion.",
+        try:
+            conn = lakeflow.create_connection(
+                _client(),
+                request.name,
+                request.connection_type,
+                request.options,
+                request.comment,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("connection creation failed")
+            return CreateConnectionResponse(status="FAILED", error=str(exc)).model_dump()
+
+        result = CreateConnectionResponse(
+            status="CREATED",
+            connection_name=getattr(conn, "name", request.name),
+            connection_type=request.connection_type.upper(),
+        ).model_dump()
+        plan_store.record_idempotency(request.idempotency_key, result)
+        logger.info("created connection %s", request.name)
+        return result
+
+    @mcp.tool()
+    def create_ingestion_pipeline(request: CreateIngestionPipelineRequest) -> dict:
+        """Create a Salesforce Lakeflow Connect ingestion pipeline.
+
+        Requires ``confirmation == 'CONFIRM'``. Idempotent via ``idempotency_key``.
+        Enforces the destination/connection allowlist.
+        """
+        if request.confirmation != "CONFIRM":
+            return CreateIngestionPipelineResponse(
+                status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
+            ).model_dump()
+
+        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        if cached is not None:
+            return cached
+
+        errors = allowlist_errors(
+            request.destination_catalog,
+            request.destination_schema,
+            request.connection_name,
+        )
+        if errors:
+            return CreateIngestionPipelineResponse(
+                status="REJECTED", error="; ".join(errors)
             ).model_dump()
 
         client = _client()
         try:
-            pipeline = lakeflow.create_pipeline(client, plan_request)
-            pipeline_id = pipeline.pipeline_id
-            job = lakeflow.create_schedule(client, plan_request, pipeline_id)
-            job_id = str(job.job_id) if job else None
+            pipeline = lakeflow.create_pipeline(client, request)
         except Exception as exc:  # noqa: BLE001
             logger.exception("pipeline creation failed")
-            return CreateResponse(
+            return CreateIngestionPipelineResponse(
                 status="FAILED", error=str(exc)
             ).model_dump()
 
-        result = CreateResponse(
-            status="CREATED",
-            pipeline_id=pipeline_id,
-            job_id=job_id,
-            pipeline_name=plan_request.pipeline_name,
-            tables=lakeflow.destination_tables(plan_request),
-            next_action="RUN_PIPELINE",
-        ).model_dump()
-
-        plan_store.consume(request.plan_id)
-        plan_store.record_idempotency(request.idempotency_key, result)
-        logger.info(
-            "created pipeline %s (job %s) for plan %s",
-            pipeline_id,
-            job_id,
-            request.plan_id,
+        tables = lakeflow.destination_tables(
+            request.destination_catalog, request.destination_schema, request.objects
         )
+        result = CreateIngestionPipelineResponse(
+            status="CREATED",
+            pipeline_id=pipeline.pipeline_id,
+            pipeline_name=request.pipeline_name,
+            tables=tables,
+            next_action="SCHEDULE_OR_TRIGGER",
+        ).model_dump()
+        plan_store.record_idempotency(request.idempotency_key, result)
+        logger.info("created pipeline %s", pipeline.pipeline_id)
         return result
+
+    @mcp.tool()
+    def schedule_pipeline(request: SchedulePipelineRequest) -> dict:
+        """Create a Lakeflow Job that refreshes a pipeline on a cron schedule.
+
+        Requires ``confirmation == 'CONFIRM'``. Idempotent via ``idempotency_key``.
+        """
+        if request.confirmation != "CONFIRM":
+            return SchedulePipelineResponse(
+                status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
+            ).model_dump()
+
+        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        if cached is not None:
+            return cached
+
+        try:
+            job = lakeflow.create_schedule(
+                _client(),
+                request.pipeline_name,
+                request.pipeline_id,
+                request.schedule,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("schedule creation failed")
+            return SchedulePipelineResponse(status="FAILED", error=str(exc)).model_dump()
+
+        result = SchedulePipelineResponse(
+            status="CREATED",
+            job_id=str(job.job_id) if job else None,
+            pipeline_id=request.pipeline_id,
+            cron_expression=request.schedule.cron_expression,
+        ).model_dump()
+        plan_store.record_idempotency(request.idempotency_key, result)
+        logger.info("scheduled pipeline %s (job %s)", request.pipeline_id, result["job_id"])
+        return result
+
+    @mcp.tool()
+    def trigger_update(request: TriggerUpdateRequest) -> dict:
+        """Start a pipeline update (incremental by default).
+
+        Requires ``confirmation == 'CONFIRM'``. Idempotent via ``idempotency_key``.
+        """
+        if request.confirmation != "CONFIRM":
+            return TriggerUpdateResponse(
+                status="REJECTED", error="Explicit confirmation 'CONFIRM' is required."
+            ).model_dump()
+
+        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        if cached is not None:
+            return cached
+
+        try:
+            update_id = lakeflow.trigger_update(
+                _client(), request.pipeline_id, request.full_refresh
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("trigger update failed")
+            return TriggerUpdateResponse(status="FAILED", error=str(exc)).model_dump()
+
+        result = TriggerUpdateResponse(
+            status="STARTED",
+            pipeline_id=request.pipeline_id,
+            update_id=update_id,
+            full_refresh=request.full_refresh,
+        ).model_dump()
+        plan_store.record_idempotency(request.idempotency_key, result)
+        logger.info("triggered update %s for pipeline %s", update_id, request.pipeline_id)
+        return result
+
+    # === SUPERVISOR (routing + human-in-the-loop) ===========================
+
+    @mcp.tool()
+    def supervisor_plan(request: SupervisorPlanRequest) -> dict:
+        """Route a gathered goal into a reviewable, ordered plan. Does NOT mutate.
+
+        Returns a ``plan_id`` that must be passed to ``supervisor_execute`` after
+        the user explicitly confirms.
+        """
+        plan = supervisor.build_plan(request.goal)
+        plan_id = plan_store.put(request.goal, plan.expires_at)
+        plan.plan_id = plan_id
+        return plan.model_dump()
+
+    @mcp.tool()
+    def supervisor_execute(request: SupervisorExecuteRequest) -> dict:
+        """Execute the write steps of a confirmed plan.
+
+        Only acts on a ``plan_id`` produced by ``supervisor_plan`` and requires
+        ``confirmation == 'CONFIRM'``. Idempotent via ``idempotency_key``.
+        """
+        if request.confirmation != "CONFIRM":
+            return {
+                "plan_id": request.plan_id,
+                "status": "REJECTED",
+                "error": "Explicit confirmation 'CONFIRM' is required.",
+            }
+
+        cached = plan_store.seen_idempotency_key(request.idempotency_key)
+        if cached is not None:
+            return cached
+
+        goal = plan_store.get(request.plan_id)
+        if goal is None:
+            return {
+                "plan_id": request.plan_id,
+                "status": "REJECTED",
+                "error": "Unknown or expired plan_id. Re-run supervisor_plan.",
+            }
+
+        result = supervisor.execute(_client(), goal)
+        result.plan_id = request.plan_id
+        payload = result.model_dump()
+
+        if result.status == "COMPLETED":
+            plan_store.consume(request.plan_id)
+        plan_store.record_idempotency(request.idempotency_key, payload)
+        logger.info(
+            "supervisor executed plan %s -> %s", request.plan_id, result.status
+        )
+        return payload
+
+    # === OBSERVABILITY ======================================================
 
     @mcp.tool()
     def get_ingestion_status(request: StatusRequest) -> dict:

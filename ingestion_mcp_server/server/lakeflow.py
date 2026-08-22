@@ -1,15 +1,16 @@
 """Databricks adapter: builds Lakeflow Connect payloads and calls the SDK.
 
-All Databricks-facing logic lives here so the MCP tool functions stay thin.
-Nothing in this module mutates the workspace except ``create_pipeline`` and
-``create_schedule``.
+This MCP maps to a single source (Salesforce). All Databricks-facing logic lives
+here so the MCP tool functions in ``tools.py`` stay thin. Only ``create_*``,
+``schedule_pipeline`` and ``trigger_update`` mutate the workspace.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.catalog import ConnectionType
 from databricks.sdk.service.jobs import CronSchedule, PauseStatus, PipelineTask, Task
 from databricks.sdk.service.pipelines import (
     IngestionConfig,
@@ -17,14 +18,21 @@ from databricks.sdk.service.pipelines import (
     TableSpec,
 )
 
-from .schemas import CreateRequest, PlanRequest, PlanResponse, SalesforceObject
+from .schemas import (
+    CreateIngestionPipelineRequest,
+    SalesforceObject,
+    Schedule,
+)
 
 
 def _destination_table(obj: SalesforceObject) -> str:
     return obj.destination_table or obj.source_table.lower()
 
 
-def build_table_specs(request: PlanRequest) -> list[TableSpec]:
+# --- payload construction (pure, unit-tested) ------------------------------
+
+
+def build_table_specs(request: CreateIngestionPipelineRequest) -> list[TableSpec]:
     """Turn the requested objects into SDK ``TableSpec`` objects."""
     specs: list[TableSpec] = []
     for obj in request.objects:
@@ -40,17 +48,20 @@ def build_table_specs(request: PlanRequest) -> list[TableSpec]:
     return specs
 
 
-def build_ingestion_definition(request: PlanRequest) -> IngestionPipelineDefinition:
+def build_ingestion_definition(
+    request: CreateIngestionPipelineRequest,
+) -> IngestionPipelineDefinition:
     return IngestionPipelineDefinition(
         connection_name=request.connection_name,
         objects=[IngestionConfig(table=spec) for spec in build_table_specs(request)],
     )
 
 
-def build_pipeline_payload(request: PlanRequest) -> dict:
+def build_pipeline_payload(request: CreateIngestionPipelineRequest) -> dict:
     """A JSON-serializable preview of the pipeline create request.
 
-    Used inside the plan so the user can review exactly what will be created.
+    Used inside a supervisor plan so the user can review exactly what will be
+    created before confirming.
     """
     return {
         "name": request.pipeline_name,
@@ -75,47 +86,125 @@ def build_pipeline_payload(request: PlanRequest) -> dict:
     }
 
 
-def build_job_payload(request: PlanRequest) -> dict | None:
-    """JSON-serializable preview of the optional refresh-schedule job."""
-    if not request.schedule:
-        return None
+def build_job_payload(pipeline_name: str, pipeline_id: str, schedule: Schedule) -> dict:
+    """JSON-serializable preview of a refresh-schedule job."""
     return {
-        "name": f"{request.pipeline_name}_schedule",
+        "name": f"{pipeline_name}_schedule",
         "schedule": {
-            "quartz_cron_expression": request.schedule.cron_expression,
-            "timezone_id": request.schedule.timezone,
+            "quartz_cron_expression": schedule.cron_expression,
+            "timezone_id": schedule.timezone,
             "pause_status": "UNPAUSED",
         },
         "tasks": [
             {
                 "task_key": "refresh_pipeline",
-                "pipeline_task": {"pipeline_id": "<pipeline_id>"},
+                "pipeline_task": {"pipeline_id": pipeline_id},
             }
         ],
     }
 
 
-def destination_tables(request: PlanRequest) -> list[str]:
-    return [
-        f"{request.destination_catalog}.{request.destination_schema}.{_destination_table(o)}"
-        for o in request.objects
-    ]
+def destination_tables(
+    catalog: str, schema: str, objects: list[SalesforceObject]
+) -> list[str]:
+    return [f"{catalog}.{schema}.{_destination_table(o)}" for o in objects]
 
 
-# --- read-only validation -------------------------------------------------
+# --- READ operations -------------------------------------------------------
+
+
+def list_connections(
+    client: WorkspaceClient, connection_type: str | None = None
+) -> list[dict]:
+    """List UC connections, optionally filtered by type (case-insensitive)."""
+    wanted = connection_type.upper() if connection_type else None
+    out: list[dict] = []
+    for conn in client.connections.list():
+        ctype = str(conn.connection_type.value) if conn.connection_type else None
+        if wanted and (ctype or "").upper() != wanted:
+            continue
+        out.append(
+            {
+                "name": conn.name,
+                "connection_type": ctype,
+                "comment": conn.comment,
+                "owner": conn.owner,
+            }
+        )
+    return out
 
 
 def validate_connection(client: WorkspaceClient, connection_name: str) -> str:
     """Return the connection status, or raise if it is not usable."""
     conn = client.connections.get(connection_name)
-    # A Salesforce UC connection should be an ONLINE/READY external connection.
     return "READY" if conn is not None else "UNKNOWN"
 
 
-# --- mutating operations --------------------------------------------------
+def list_source_objects(
+    client: WorkspaceClient,
+    connection_name: str,
+    source_schema: str | None = None,
+    name_contains: str | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Best-effort listing of ingestible objects behind a Salesforce connection.
+
+    Salesforce object discovery is not uniformly exposed by the SDK across
+    workspaces, so this returns whatever the connection surfaces plus warnings
+    when discovery is unavailable. Callers should treat an empty list as
+    "verify object names against Salesforce" rather than "no objects".
+    """
+    warnings: list[str] = []
+    objects: list[dict] = []
+    needle = name_contains.lower() if name_contains else None
+
+    try:
+        # UC exposes foreign objects via list_schemas/list_tables when the
+        # connection is federated. For Salesforce ingestion connections this
+        # may be empty; we degrade gracefully.
+        schemas = (
+            [source_schema]
+            if source_schema
+            else [s.name for s in client.schemas.list(catalog_name=connection_name)]
+        )
+        for sch in schemas:
+            for tbl in client.tables.list(
+                catalog_name=connection_name, schema_name=sch
+            ):
+                if needle and needle not in (tbl.name or "").lower():
+                    continue
+                objects.append({"source_schema": sch, "source_table": tbl.name})
+    except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+        warnings.append(
+            "Automatic object discovery is unavailable for this connection "
+            f"({exc}). Provide Salesforce object names explicitly."
+        )
+    return objects, warnings
 
 
-def create_pipeline(client: WorkspaceClient, request: PlanRequest):
+# --- WRITE operations ------------------------------------------------------
+
+
+def create_connection(
+    client: WorkspaceClient,
+    name: str,
+    connection_type: str,
+    options: dict[str, str],
+    comment: str | None,
+):
+    """Create a Unity Catalog connection.
+
+    Secrets/OAuth are handled by the AI Gateway; only non-secret ``options``
+    are passed through here.
+    """
+    return client.connections.create(
+        name=name,
+        connection_type=ConnectionType(connection_type.upper()),
+        options=options,
+        comment=comment,
+    )
+
+
+def create_pipeline(client: WorkspaceClient, request: CreateIngestionPipelineRequest):
     """Create the Lakeflow Connect ingestion pipeline."""
     return client.pipelines.create(
         name=request.pipeline_name,
@@ -123,15 +212,18 @@ def create_pipeline(client: WorkspaceClient, request: PlanRequest):
     )
 
 
-def create_schedule(client: WorkspaceClient, request: PlanRequest, pipeline_id: str):
-    """Create the optional Lakeflow Job that refreshes the pipeline."""
-    if not request.schedule:
-        return None
+def create_schedule(
+    client: WorkspaceClient,
+    pipeline_name: str,
+    pipeline_id: str,
+    schedule: Schedule,
+):
+    """Create a Lakeflow Job that refreshes the pipeline on a cron schedule."""
     return client.jobs.create(
-        name=f"{request.pipeline_name}_schedule",
+        name=f"{pipeline_name}_schedule",
         schedule=CronSchedule(
-            quartz_cron_expression=request.schedule.cron_expression,
-            timezone_id=request.schedule.timezone,
+            quartz_cron_expression=schedule.cron_expression,
+            timezone_id=schedule.timezone,
             pause_status=PauseStatus.UNPAUSED,
         ),
         tasks=[
@@ -141,6 +233,17 @@ def create_schedule(client: WorkspaceClient, request: PlanRequest, pipeline_id: 
             )
         ],
     )
+
+
+def trigger_update(
+    client: WorkspaceClient, pipeline_id: str, full_refresh: bool = False
+) -> str | None:
+    """Start a pipeline update (incremental by default) and return its id."""
+    resp = client.pipelines.start_update(pipeline_id, full_refresh=full_refresh)
+    return getattr(resp, "update_id", None)
+
+
+# --- observability ---------------------------------------------------------
 
 
 def get_pipeline_status(
@@ -162,13 +265,5 @@ def get_pipeline_status(
     return result
 
 
-def build_plan_response(request: PlanRequest, plan_id: str, ttl_minutes: int = 30):
-    expires = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
-    return PlanResponse(
-        plan_id=plan_id,
-        expires_at=expires.isoformat().replace("+00:00", "Z"),
-        requires_confirmation=True,
-        pipeline_payload=build_pipeline_payload(request),
-        job_payload=build_job_payload(request),
-        destination_tables=destination_tables(request),
-    )
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

@@ -9,7 +9,7 @@ from fastmcp import FastMCP
 
 from .tools import register_tools
 
-mcp = FastMCP("salesforce-lakeflow-provisioner")
+mcp = FastMCP("salesforce-lakeflow-ingestion-agent")
 register_tools(mcp)
 
 mcp_app = mcp.http_app(
@@ -18,7 +18,7 @@ mcp_app = mcp.http_app(
 )
 
 app = FastAPI(
-    title="Salesforce Lakeflow MCP Server",
+    title="Salesforce Lakeflow Ingestion Agent MCP Server",
     lifespan=mcp_app.lifespan,
     routes=mcp_app.routes,
 )
@@ -27,7 +27,7 @@ app = FastAPI(
 @app.get("/")
 def root() -> dict:
     return {
-        "service": "salesforce-lakeflow-provisioner",
+        "service": "salesforce-lakeflow-ingestion-agent",
         "mcp_endpoint": "/mcp",
         "docs": "/docs",
         "health": "/health",

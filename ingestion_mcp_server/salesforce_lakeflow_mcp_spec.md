@@ -44,6 +44,21 @@ The agent should never create resources immediately after inferring intent. It s
 
 ## MCP tool contract
 
+> **Implementation note.** The original three-verb contract below
+> (`validate_salesforce_ingestion` / `plan_salesforce_ingestion` /
+> `create_salesforce_ingestion`) has been superseded by a finer-grained,
+> single-source surface. One MCP maps to one source (this repo = Salesforce):
+>
+> - **Read:** `list_connections`, `list_source_objects`, `validate_destination`
+> - **Write** (each needs `confirmation="CONFIRM"` + `idempotency_key`):
+>   `create_connection`, `create_ingestion_pipeline`, `schedule_pipeline`,
+>   `trigger_update`
+> - **Supervisor** (routing + human-in-the-loop): `supervisor_plan` (was
+>   `plan_*`, read-only) and `supervisor_execute` (was `create_*`, runs the
+>   confirmed plan's write steps in order).
+>
+> The JSON below is retained as the original design reference.
+
 ### `validate_salesforce_ingestion`
 
 Read-only validation before planning or creation.
