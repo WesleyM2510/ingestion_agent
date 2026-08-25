@@ -29,18 +29,16 @@ resources:
 # `bundle run mcp_salesforce_lakeflow` first so the app has a URL, then the
 # hook (which also fires on the next `deploy`) will find it. The script is
 # idempotent and re-runnable on its own.
-experimental:
-  scripts:
-    postdeploy: bash ./scripts/register_mcp_service.sh
+# NEEDS DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION be unset
+# experimental:
+#   scripts:
+#     postdeploy: bash ./scripts/register_mcp_service.sh
 
 targets:
   dev:
     mode: development
     default: true
-    workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
+   
 
   prod:
     mode: production
-    workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com

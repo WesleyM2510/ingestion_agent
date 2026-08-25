@@ -1,0 +1,39 @@
+The user asked to test source object discovery for each available Salesforce connection. Listing source objects is the read-only way to verify whether object discovery works for each connection.
+
+Tool call: list_source_objects
+<tool_call>{"id":"QT8nfZcOEloV5amnhqNz","name":"list_source_objects","arguments":"{\"request\":{\"connection_name\":\"con_salesforce_prd\"}}"}</tool_call>
+
+
+
+Tool call output:
+<tool_call_result>{"id":"QT8nfZcOEloV5amnhqNz","content":"{\"connection_name\":\"con_salesforce_prd\",\"objects\":[],\"warnings\":[\"Automatic object discovery is unavailable for this connection (Catalog 'con_salesforce_prd' does not exist.). Provide Salesforce object names explicitly.\"]}"}</tool_call_result>
+
+The user asked to test source object discovery for each Salesforce connection; this checks automatic object discovery for con_salesforce_hml.
+
+
+
+Tool call: list_source_objects
+<tool_call>{"id":"cSFgib4xcIGsAWRFZ4xC","name":"list_source_objects","arguments":"{\"request\":{\"connection_name\":\"con_salesforce_hml\"}}"}</tool_call>
+
+
+
+Tool call output:
+<tool_call_result>{"id":"cSFgib4xcIGsAWRFZ4xC","content":"{\"connection_name\":\"con_salesforce_hml\",\"objects\":[],\"warnings\":[\"Automatic object discovery is unavailable for this connection (Catalog 'con_salesforce_hml' does not exist.). Provide Salesforce object names explicitly.\"]}"}</tool_call_result>
+
+Tested source object discovery for the Salesforce connections:
+
+| Connection | Result |
+|---|---|
+| `con_salesforce` | Automatic discovery unavailable |
+| `con_salesforce_hml` | Automatic discovery unavailable |
+| `con_salesforce_prd` | Automatic discovery unavailable |
+
+Warnings:
+
+- `con_salesforce`: `Catalog 'con_salesforce' does not exist.`
+- `con_salesforce_hml`: `Catalog 'con_salesforce_hml' does not exist.`
+- `con_salesforce_prd`: `Catalog 'con_salesforce_prd' does not exist.`
+
+No source objects were returned automatically for any connection.
+
+You can still create/validate ingestion by providing Salesforce object names explicitly, such as `Account`, `Contact`, `Opportunity`, etc.
