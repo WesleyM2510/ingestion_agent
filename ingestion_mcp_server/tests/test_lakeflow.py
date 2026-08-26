@@ -70,6 +70,53 @@ def test_job_payload_shape():
     assert job["tasks"][0]["pipeline_task"]["pipeline_id"] == "01ef"
 
 
+# --- existing-pipeline lookup ----------------------------------------------
+
+
+class _FakePipelines:
+    def __init__(self, pipelines):
+        self._pipelines = pipelines
+        self.filters: list[str] = []
+
+    def list_pipelines(self, filter=None):
+        self.filters.append(filter)
+        return iter(self._pipelines)
+
+
+def _client_with_pipelines(pipelines):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(pipelines=_FakePipelines(pipelines))
+
+
+def test_find_pipeline_by_name_exact_match():
+    from types import SimpleNamespace
+
+    client = _client_with_pipelines(
+        [
+            SimpleNamespace(name="salesforce_to_uc_v2", pipeline_id="AAA"),
+            SimpleNamespace(name="salesforce_to_uc", pipeline_id="BBB"),
+        ]
+    )
+    assert lakeflow.find_pipeline_by_name(client, "salesforce_to_uc") == {
+        "pipeline_id": "BBB",
+        "name": "salesforce_to_uc",
+    }
+
+
+def test_find_pipeline_by_name_returns_none_when_absent():
+    from types import SimpleNamespace
+
+    client = _client_with_pipelines([SimpleNamespace(name="other", pipeline_id="X")])
+    assert lakeflow.find_pipeline_by_name(client, "salesforce_to_uc") is None
+
+
+def test_find_pipeline_by_name_escapes_like_wildcards():
+    client = _client_with_pipelines([])
+    lakeflow.find_pipeline_by_name(client, "sf_100%_load")
+    assert client.pipelines.filters[0] == "name LIKE 'sf\\_100\\%\\_load'"
+
+
 # --- idempotency store -----------------------------------------------------
 
 

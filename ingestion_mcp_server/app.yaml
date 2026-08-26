@@ -21,3 +21,18 @@ env:
     value: ""      # entries look like "main.salesforce_raw"
   - name: ALLOWED_CONNECTIONS
     value: ""
+
+  # Salesforce source-object discovery (list_source_objects). Databricks has no
+  # API that enumerates SObjects for a connection, so discovery queries the
+  # Salesforce org directly via describeGlobal. These are a SEPARATE connected
+  # app from the UC connection's OAuth secret (which the app cannot read).
+  # Without them, list_source_objects returns a curated list of common standard
+  # objects; with them, it returns all queryable objects incl. custom (__c).
+  # Global defaults (used when no per-connection override is set):
+  #   SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_API_VERSION, SF_TOKEN
+  # Per-connection overrides use the upper-cased connection name, e.g. for
+  # connection "con_salesforce_prd":
+  #   SF_CON_SALESFORCE_PRD_INSTANCE_URL, SF_CON_SALESFORCE_PRD_CLIENT_ID, ...
+  # Prefer sourcing secrets from a Databricks secret scope rather than plaintext.
+  # - name: SF_INSTANCE_URL
+  #   value: "https://<domain>.my.salesforce.com"

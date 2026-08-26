@@ -18,6 +18,7 @@ from databricks.sdk.service.pipelines import (
     TableSpec,
 )
 
+from . import salesforce
 from .schemas import (
     CreateIngestionPipelineRequest,
     SalesforceObject,
@@ -145,38 +146,26 @@ def list_source_objects(
     source_schema: str | None = None,
     name_contains: str | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """Best-effort listing of ingestible objects behind a Salesforce connection.
+    """List ingestible Salesforce objects behind a connection.
 
-    Salesforce object discovery is not uniformly exposed by the SDK across
-    workspaces, so this returns whatever the connection surfaces plus warnings
-    when discovery is unavailable. Callers should treat an empty list as
-    "verify object names against Salesforce" rather than "no objects".
+    A Salesforce Lakeflow Connect connection is *not* a federated foreign
+    catalog, so it exposes no objects via UC ``list_schemas``/``list_tables``.
+    The authoritative source is the Salesforce org itself, queried through its
+    ``describeGlobal`` endpoint (see ``server.salesforce``). Live discovery
+    requires separately-configured Salesforce connected-app credentials; when
+    those are absent the discovery layer returns a curated list of common
+    standard objects plus a warning.
+
+    ``source_schema`` labels the returned objects (Lakeflow expects a source
+    schema, defaulting to ``salesforce``); it does not scope the Salesforce
+    query. Returns ``(objects, warnings)`` where each object is
+    ``{"source_schema": ..., "source_table": <SObject API name>}``.
     """
-    warnings: list[str] = []
-    objects: list[dict] = []
-    needle = name_contains.lower() if name_contains else None
-
-    try:
-        # UC exposes foreign objects via list_schemas/list_tables when the
-        # connection is federated. For Salesforce ingestion connections this
-        # may be empty; we degrade gracefully.
-        schemas = (
-            [source_schema]
-            if source_schema
-            else [s.name for s in client.schemas.list(catalog_name=connection_name)]
-        )
-        for sch in schemas:
-            for tbl in client.tables.list(
-                catalog_name=connection_name, schema_name=sch
-            ):
-                if needle and needle not in (tbl.name or "").lower():
-                    continue
-                objects.append({"source_schema": sch, "source_table": tbl.name})
-    except Exception as exc:  # noqa: BLE001 - discovery is best-effort
-        warnings.append(
-            "Automatic object discovery is unavailable for this connection "
-            f"({exc}). Provide Salesforce object names explicitly."
-        )
+    schema_label = source_schema or "salesforce"
+    names, warnings = salesforce.discover_objects(connection_name, name_contains)
+    objects = [
+        {"source_schema": schema_label, "source_table": name} for name in names
+    ]
     return objects, warnings
 
 
@@ -201,6 +190,21 @@ def create_connection(
         options=options,
         comment=comment,
     )
+
+
+def find_pipeline_by_name(client: WorkspaceClient, name: str) -> dict | None:
+    """Return an existing pipeline with an exact name match, or ``None``.
+
+    Pipeline names are not guaranteed unique in Databricks, so the ``name LIKE``
+    server filter is only a prefilter; we match the name exactly and return the
+    first hit (lowest id, as ``list_pipelines`` defaults to ``id asc``).
+    """
+    # Escape LIKE wildcards so a name containing % or _ can't over-match.
+    escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    for p in client.pipelines.list_pipelines(filter=f"name LIKE '{escaped}'"):
+        if p.name == name:
+            return {"pipeline_id": p.pipeline_id, "name": p.name}
+    return None
 
 
 def create_pipeline(client: WorkspaceClient, request: CreateIngestionPipelineRequest):

@@ -187,6 +187,37 @@ def register_tools(mcp) -> None:
             ).model_dump()
 
         client = _client()
+
+        # Skip creation if a pipeline with this name already exists, so a
+        # re-run does not create a duplicate (and does not re-sync the tables).
+        # This is durable across app restarts, unlike the in-memory idempotency
+        # cache; to refresh an existing pipeline, use trigger_update instead.
+        try:
+            existing = lakeflow.find_pipeline_by_name(client, request.pipeline_name)
+        except Exception as exc:  # noqa: BLE001 - lookup must not block on transient errors
+            logger.warning("existing-pipeline lookup failed: %s", exc)
+            existing = None
+        if existing is not None:
+            tables = lakeflow.destination_tables(
+                request.destination_catalog,
+                request.destination_schema,
+                request.objects,
+            )
+            result = CreateIngestionPipelineResponse(
+                status="ALREADY_EXISTS",
+                pipeline_id=existing["pipeline_id"],
+                pipeline_name=existing["name"],
+                tables=tables,
+                next_action="SCHEDULE_OR_TRIGGER",
+            ).model_dump()
+            idempotency_store.record_idempotency(request.idempotency_key, result)
+            logger.info(
+                "pipeline %s already exists (%s); skipping create",
+                request.pipeline_name,
+                existing["pipeline_id"],
+            )
+            return result
+
         try:
             pipeline = lakeflow.create_pipeline(client, request)
         except Exception as exc:  # noqa: BLE001
