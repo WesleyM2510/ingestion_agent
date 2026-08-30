@@ -162,7 +162,7 @@ def list_source_objects(
     ``{"source_schema": ..., "source_table": <SObject API name>}``.
     """
     schema_label = source_schema or "objects"
-    names, warnings = salesforce.discover_objects(connection_name, name_contains)
+    names, warnings = salesforce.discover_objects(client, connection_name, name_contains)
     objects = [
         {"source_schema": schema_label, "source_table": name} for name in names
     ]

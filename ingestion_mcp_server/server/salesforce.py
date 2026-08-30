@@ -29,7 +29,9 @@ nothing. Only live discovery can surface custom ``__c`` objects.
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -38,6 +40,14 @@ import urllib.request
 
 DEFAULT_API_VERSION = "60.0"
 _HTTP_TIMEOUT = 30
+
+# Secret scope and keys for Salesforce discovery credentials.
+SECRET_SCOPE = "SALESFORCE_MCP_SCOPE"
+SECRET_KEY_INSTANCE_URL = "INSTANCE_URL"
+SECRET_KEY_CLIENT_ID = "CLIENT_ID"
+SECRET_KEY_CLIENT_SECRET = "CLIENT_SECRET"
+
+logger = logging.getLogger(__name__)
 
 # Common Salesforce standard objects, used as a fallback suggestion list when no
 # Salesforce credentials are configured for live discovery. This is NOT
@@ -93,6 +103,45 @@ def _resolve(connection_name: str, suffix: str) -> str | None:
     return os.getenv(_env_prefix(connection_name) + suffix) or os.getenv(
         "SF_" + suffix
     )
+
+
+def resolve_credentials_from_secret_scope(
+    client,
+) -> SalesforceCredentials | None:
+    """Resolve Salesforce credentials from a Databricks secret scope.
+
+    Reads INSTANCE_URL, CLIENT_ID, CLIENT_SECRET from the scope named
+    SALESFORCE_MCP_SCOPE. Returns None if the scope/keys are missing, unreadable,
+    or if INSTANCE_URL is empty. Values are base64-decoded as returned by the API.
+    """
+    if client is None:
+        return None
+
+    try:
+        # Read INSTANCE_URL (required; if missing, we skip the secret scope path).
+        resp = client.secrets.get_secret(SECRET_SCOPE, SECRET_KEY_INSTANCE_URL)
+        instance_url = base64.b64decode(resp.value).decode("utf-8").strip()
+        if not instance_url:
+            return None
+
+        # Read CLIENT_ID and CLIENT_SECRET.
+        resp_id = client.secrets.get_secret(SECRET_SCOPE, SECRET_KEY_CLIENT_ID)
+        client_id = base64.b64decode(resp_id.value).decode("utf-8").strip()
+
+        resp_secret = client.secrets.get_secret(SECRET_SCOPE, SECRET_KEY_CLIENT_SECRET)
+        client_secret = base64.b64decode(resp_secret.value).decode("utf-8").strip()
+
+        return SalesforceCredentials(
+            instance_url=instance_url,
+            api_version=DEFAULT_API_VERSION,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Any read error (scope missing, key missing, permission denied, etc.)
+        # -> treat as "no secret scope credentials available".
+        logger.debug("Secret scope credentials unavailable: %s", exc)
+        return None
 
 
 def resolve_credentials(connection_name: str) -> SalesforceCredentials | None:
@@ -155,7 +204,9 @@ def describe_global(creds: SalesforceCredentials, token: str) -> list[dict]:
 
 
 def discover_objects(
-    connection_name: str, name_contains: str | None = None
+    client,
+    connection_name: str,
+    name_contains: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Discover ingestible Salesforce object API names for a connection.
 
@@ -163,6 +214,11 @@ def discover_objects(
     performs live discovery (queryable objects only, including custom ``__c``);
     otherwise it returns the curated common-standard-object fallback with a
     warning explaining how to enable full discovery.
+
+    Credentials are tried in this order:
+      1. Secret scope (SALESFORCE_MCP_SCOPE) if client is provided.
+      2. Environment variables (per-connection or global SF_* vars).
+      3. Curated fallback with a warning.
     """
     warnings: list[str] = []
     needle = name_contains.lower() if name_contains else None
@@ -172,14 +228,19 @@ def discover_objects(
             return names
         return [n for n in names if needle in n.lower()]
 
-    creds = resolve_credentials(connection_name)
+    # Try secret scope first (primary).
+    creds = resolve_credentials_from_secret_scope(client)
+    # Fall back to env vars (secondary).
+    if creds is None:
+        creds = resolve_credentials(connection_name)
+    # Fall back to curated list (tertiary).
     if creds is None:
         warnings.append(
-            "No Salesforce credentials configured for connection "
-            f"'{connection_name}'; returning a curated list of common standard "
-            "objects. Set SF_<CONNECTION>_INSTANCE_URL / _CLIENT_ID / "
-            "_CLIENT_SECRET (or SF_INSTANCE_URL / ...) to enable live discovery "
-            "of all objects, including custom (__c) objects."
+            "No working Salesforce credentials found. Returning the default "
+            "curated list of common standard objects. To enable live discovery "
+            "of all objects (including custom __c objects), create a Databricks "
+            "secret scope named 'SALESFORCE_MCP_SCOPE' containing the keys "
+            "INSTANCE_URL, CLIENT_ID, and CLIENT_SECRET."
         )
         return _filter(list(COMMON_STANDARD_OBJECTS)), warnings
 
