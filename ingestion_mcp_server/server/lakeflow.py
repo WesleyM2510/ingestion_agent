@@ -157,11 +157,11 @@ def list_source_objects(
     standard objects plus a warning.
 
     ``source_schema`` labels the returned objects (Lakeflow expects a source
-    schema, defaulting to ``salesforce``); it does not scope the Salesforce
+    schema, defaulting to ``objects``); it does not scope the Salesforce
     query. Returns ``(objects, warnings)`` where each object is
     ``{"source_schema": ..., "source_table": <SObject API name>}``.
     """
-    schema_label = source_schema or "salesforce"
+    schema_label = source_schema or "objects"
     names, warnings = salesforce.discover_objects(connection_name, name_contains)
     objects = [
         {"source_schema": schema_label, "source_table": name} for name in names
@@ -212,6 +212,8 @@ def create_pipeline(client: WorkspaceClient, request: CreateIngestionPipelineReq
     return client.pipelines.create(
         name=request.pipeline_name,
         ingestion_definition=build_ingestion_definition(request),
+        catalog=request.destination_catalog,
+        schema=request.destination_schema,
     )
 
 

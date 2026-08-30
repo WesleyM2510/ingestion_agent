@@ -36,8 +36,8 @@ class SalesforceObject(BaseModel):
 
     source_table: str = Field(description="Salesforce object name, e.g. Account")
     source_schema: str = Field(
-        default="salesforce",
-        description="Source schema within the Salesforce connection.",
+        default="objects",
+        description="Source schema (must be 'objects' for Salesforce standard/custom SObjects in Lakeflow Connect).",
     )
     destination_table: str | None = Field(
         default=None,
