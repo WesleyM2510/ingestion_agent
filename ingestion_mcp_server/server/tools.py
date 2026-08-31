@@ -186,6 +186,15 @@ def register_tools(mcp) -> None:
                 status="REJECTED", error="; ".join(errors)
             ).model_dump()
 
+        # Generate pipeline name if not provided
+        if not request.pipeline_name:
+            request.pipeline_name = lakeflow.generate_pipeline_name(
+                request.destination_catalog,
+                request.destination_schema,
+                request.objects,
+            )
+            logger.info("auto-generated pipeline name: %s", request.pipeline_name)
+
         client = _client()
 
         # Skip creation if a pipeline with this name already exists, so a

@@ -122,28 +122,54 @@ rm -f /tmp/_conn.json
 # --- Step 2: MCP Service under cielo.default ------------------------------
 # Beta: only REST API / UI can create MCP Services (no CLI verb, no SQL DDL).
 # include_tool_selectors restricts exposed tools to our domain tools.
+# Tool selectors list (factored to keep create and patch in sync).
+TOOL_SELECTORS=$(cat <<JSON
+[
+  "list_connections",
+  "list_source_objects",
+  "validate_destination",
+  "create_connection",
+  "create_ingestion_pipeline",
+  "schedule_pipeline",
+  "trigger_update",
+  "get_ingestion_status"
+]
+JSON
+)
+
 echo ">> Registering MCP Service '${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}'."
-cli api post \
-  "/api/2.1/unity-catalog/mcp-services?parent=schemas/${MCP_CATALOG}.${MCP_SCHEMA}&mcp_service_id=${MCP_SERVICE_ID}" \
-  --json "$(cat <<JSON
+
+# Check if the MCP Service already exists.
+if cli api get "/api/2.1/unity-catalog/mcp-services/${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}" \
+  --output json >/tmp/_mcp_service.json 2>/dev/null; then
+  echo ">> MCP Service already exists. Patching to re-point connection and refresh tool selectors."
+  cli api patch \
+    "/api/2.1/unity-catalog/mcp-services/${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}?update_mask=config" \
+    --json "$(cat <<JSON
+{
+  "config": {
+    "source_connection": { "name": "connections/${CONNECTION_NAME}" },
+    "include_tool_selectors": ${TOOL_SELECTORS}
+  }
+}
+JSON
+)"
+else
+  echo ">> Creating new MCP Service."
+  cli api post \
+    "/api/2.1/unity-catalog/mcp-services?parent=schemas/${MCP_CATALOG}.${MCP_SCHEMA}&mcp_service_id=${MCP_SERVICE_ID}" \
+    --json "$(cat <<JSON
 {
   "comment": "Salesforce Lakeflow Connect ingestion agent MCP server.",
   "config": {
     "source_connection": { "name": "connections/${CONNECTION_NAME}" },
-    "include_tool_selectors": [
-      "list_connections",
-      "list_source_objects",
-      "validate_destination",
-      "create_connection",
-      "create_ingestion_pipeline",
-      "schedule_pipeline",
-      "trigger_update",
-      "get_ingestion_status"
-    ]
+    "include_tool_selectors": ${TOOL_SELECTORS}
   }
 }
 JSON
-)" || echo "!! MCP Service create returned non-zero (may already exist). Check with: databricks api get /api/2.1/unity-catalog/mcp-services/${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}"
+)"
+fi
+rm -f /tmp/_mcp_service.json
 
 echo ">> Done. MCP Service: ${MCP_CATALOG}.${MCP_SCHEMA}.${MCP_SERVICE_ID}"
 echo "   Grant EXECUTE to users, then add it in an agent by that 3-level name."

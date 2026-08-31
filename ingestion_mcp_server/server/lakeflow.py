@@ -7,6 +7,8 @@ here so the MCP tool functions in ``tools.py`` stay thin. Only ``create_*``,
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import datetime, timezone
 
 from databricks.sdk import WorkspaceClient
@@ -28,6 +30,57 @@ from .schemas import (
 
 def _destination_table(obj: SalesforceObject) -> str:
     return obj.destination_table or obj.source_table.lower()
+
+
+def generate_pipeline_name(
+    catalog: str, schema: str, objects: list[SalesforceObject]
+) -> str:
+    """Generate a deterministic pipeline name from source objects and destination.
+
+    Format: sf_<objects>_<catalog>_<schema>
+    - Objects: source_table names lowercased and joined by _, in order given
+    - If the objects part would make total name too long (>60 chars), truncate
+      objects and append a short deterministic hash (first 8 chars of sha1)
+    - Sanitizes all parts to lowercase alphanumerics + underscore
+
+    Examples:
+      [Account] -> "sf_account_cielo_default"
+      [Account, Contact] -> "sf_account_contact_cielo_default"
+      Long list -> "sf_account_contact_opp_<8hexhash>_cielo_default"
+    """
+
+    def sanitize(s: str) -> str:
+        """Convert to lowercase and replace non-alphanumeric chars with underscore."""
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9_]", "_", s)
+        # Collapse multiple underscores into one
+        s = re.sub(r"_+", "_", s)
+        # Strip leading/trailing underscores
+        s = s.strip("_")
+        return s
+
+    # Sanitize catalog and schema
+    catalog_safe = sanitize(catalog)
+    schema_safe = sanitize(schema)
+
+    # Build objects part: join source_table names (sanitized, lowercased)
+    object_names = [sanitize(obj.source_table) for obj in objects]
+    objects_str = "_".join(object_names)
+
+    # Check if we need truncation + hash
+    # Format: sf_<objects>_<catalog>_<schema>
+    # Max length for objects part: roughly 60 chars to keep total name reasonable
+    max_objects_len = 60
+    if len(objects_str) > max_objects_len:
+        # Create deterministic hash from original (pre-sanitized) object names
+        original_list = ",".join(obj.source_table for obj in objects)
+        hash_hex = hashlib.sha1(original_list.encode()).hexdigest()[:8]
+        # Truncate objects to fit and append hash
+        objects_str = (
+            objects_str[: max_objects_len - len(hash_hex) - 1] + "_" + hash_hex
+        )
+
+    return f"sf_{objects_str}_{catalog_safe}_{schema_safe}"
 
 
 # --- payload construction (pure, unit-tested) ------------------------------
@@ -157,12 +210,12 @@ def list_source_objects(
     standard objects plus a warning.
 
     ``source_schema`` labels the returned objects (Lakeflow expects a source
-    schema, defaulting to ``salesforce``); it does not scope the Salesforce
+    schema, defaulting to ``objects``); it does not scope the Salesforce
     query. Returns ``(objects, warnings)`` where each object is
     ``{"source_schema": ..., "source_table": <SObject API name>}``.
     """
-    schema_label = source_schema or "salesforce"
-    names, warnings = salesforce.discover_objects(connection_name, name_contains)
+    schema_label = source_schema or "objects"
+    names, warnings = salesforce.discover_objects(client, connection_name, name_contains)
     objects = [
         {"source_schema": schema_label, "source_table": name} for name in names
     ]
@@ -212,6 +265,8 @@ def create_pipeline(client: WorkspaceClient, request: CreateIngestionPipelineReq
     return client.pipelines.create(
         name=request.pipeline_name,
         ingestion_definition=build_ingestion_definition(request),
+        catalog=request.destination_catalog,
+        schema=request.destination_schema,
     )
 
 

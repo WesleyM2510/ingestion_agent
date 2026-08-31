@@ -36,8 +36,8 @@ class SalesforceObject(BaseModel):
 
     source_table: str = Field(description="Salesforce object name, e.g. Account")
     source_schema: str = Field(
-        default="salesforce",
-        description="Source schema within the Salesforce connection.",
+        default="objects",
+        description="Source schema (must be 'objects' for Salesforce standard/custom SObjects in Lakeflow Connect).",
     )
     destination_table: str | None = Field(
         default=None,
@@ -161,7 +161,11 @@ class CreateConnectionResponse(BaseModel):
 
 
 class CreateIngestionPipelineRequest(BaseModel):
-    pipeline_name: str
+    pipeline_name: str | None = Field(
+        default=None,
+        description="Optional pipeline name. Auto-generated from source objects and destination (catalog.schema) if omitted. "
+        "Format: sf_<objects>_<catalog>_<schema>. When provided, used verbatim.",
+    )
     connection_name: str
     destination_catalog: str
     destination_schema: str
