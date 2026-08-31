@@ -125,3 +125,65 @@ def test_idempotency_cache():
     assert store.seen_idempotency_key("k1") is None
     store.record_idempotency("k1", {"status": "CREATED"})
     assert store.seen_idempotency_key("k1") == {"status": "CREATED"}
+
+
+# --- pipeline name generation -----------------------------------------------
+
+
+def test_generate_pipeline_name_single_object():
+    objs = [SalesforceObject(source_table="Account")]
+    name = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    assert name == "sf_account_cielo_default"
+
+
+def test_generate_pipeline_name_multiple_objects():
+    objs = [
+        SalesforceObject(source_table="Account"),
+        SalesforceObject(source_table="Contact"),
+    ]
+    name = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    assert name == "sf_account_contact_cielo_default"
+
+
+def test_generate_pipeline_name_mixed_case():
+    objs = [SalesforceObject(source_table="Account")]
+    name = lakeflow.generate_pipeline_name("Cielo", "Default", objs)
+    assert name == "sf_account_cielo_default"
+
+
+def test_generate_pipeline_name_custom_objects_with_special_chars():
+    objs = [SalesforceObject(source_table="Custom__c")]
+    name = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    assert name == "sf_custom_c_cielo_default"
+
+
+def test_generate_pipeline_name_with_spaces_and_hyphens():
+    objs = [SalesforceObject(source_table="My-Account")]
+    name = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    assert name == "sf_my_account_cielo_default"
+
+
+def test_generate_pipeline_name_long_object_list_triggers_hash():
+    # Create a long list of objects that exceeds 60 chars for objects part
+    objs = [
+        SalesforceObject(source_table=f"VeryLongObjectName{i}") for i in range(10)
+    ]
+    name = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    # Should contain hash: sf_<truncated>_<8hexchars>_cielo_default
+    assert name.startswith("sf_")
+    assert name.endswith("_cielo_default")
+    # Extract the hash part (should be 8 hex chars)
+    parts = name.split("_")
+    # Format is sf_..._HASH_cielo_default, so HASH is -3 from end
+    hash_part = parts[-3]
+    assert len(hash_part) == 8
+    assert all(c in "0123456789abcdef" for c in hash_part)
+
+
+def test_generate_pipeline_name_long_list_is_deterministic():
+    objs = [
+        SalesforceObject(source_table=f"VeryLongObjectName{i}") for i in range(10)
+    ]
+    name1 = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    name2 = lakeflow.generate_pipeline_name("cielo", "default", objs)
+    assert name1 == name2

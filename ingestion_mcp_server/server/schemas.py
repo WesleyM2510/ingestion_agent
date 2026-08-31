@@ -161,7 +161,11 @@ class CreateConnectionResponse(BaseModel):
 
 
 class CreateIngestionPipelineRequest(BaseModel):
-    pipeline_name: str
+    pipeline_name: str | None = Field(
+        default=None,
+        description="Optional pipeline name. Auto-generated from source objects and destination (catalog.schema) if omitted. "
+        "Format: sf_<objects>_<catalog>_<schema>. When provided, used verbatim.",
+    )
     connection_name: str
     destination_catalog: str
     destination_schema: str
